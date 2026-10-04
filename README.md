@@ -11,7 +11,8 @@
 | --- | --- |
 | `app/src/elfaudit/elf.py` | 严格 ELF64 LE ET_DYN 解析器：PT_LOAD 虚拟地址映射、PT_DYNAMIC、DT_NEEDED、动态字符串、符号表、SysV/GNU 哈希、版本表（VERSYM/VERDEF/VERNEED） |
 | `app/src/elfaudit/audit.py` | 审计引擎：BFS 装载序、依赖环去重、版本感知绑定、裁决生成 |
-| `app/src/server.py` | HTTP API（仅标准库）：`POST /audits`、`GET /audits/{id}`、`GET /healthz` |
+| `app/src/elfaudit/replay.py` | 替换复核引擎：仅引用冻结输入替换一个实际装载依赖，重走同一套发现/绑定规则，逐项给出目标引用的稳定差异 |
+| `app/src/server.py` | HTTP API（仅标准库）：`POST /audits`、`GET /audits/{id}`、`POST/GET .../replacement-reviews`、`GET /healthz` |
 | `tools/elfbuilder.py` | 合成 ELF 构造器与腐坏工具（测试与端到端验证共用） |
 | `tests/` | 解析规则与审计语义单元测试（`unittest`，零三方依赖） |
 | `verify/verify.py` | 端到端验收：HTTP 冒烟 + 版本遮蔽/弱符号/损坏动态表场景 + 穿插单元测试 |
@@ -42,6 +43,84 @@
 ### `GET /audits/{id}`
 
 返回冻结裁决（`200`），未知标识返回 `404`。
+
+### `POST /audits/{id}/replacement-reviews`
+
+在已冻结审计 `{id}` 之上创建（或重放）一个**替换复核**：调用方给出新的
+复核标识、已装载对象名和候选 ELF64 原字节。
+
+```json
+{
+  "review_id": "rv-1",
+  "object_name": "liba.so",
+  "candidate": "<Base64 的候选 ELF 原字节>"
+}
+```
+
+- 复核**只能引用**该审计被冻结的原始目标字节与依赖输入：候选字节仅替换
+  冻结依赖中同名的一个槽位，随后完整重走既有的 BFS 依赖发现（环去重、
+  缺失依赖拒绝）与版本感知绑定规则；候选对象可经其 `DT_NEEDED` 把已在
+  冻结输入中存在但此前未装载的对象带入装载序，但不能引用任何外部新字节。
+- 前提不满足时不是 HTTP 错误，而是 `status: "rejected"` 的可定位结论
+  （`error.object/field/message/offset`）：基础审计为结构拒绝（`base_audit`）、
+  `object_name` 不在该审计的**实际装载范围**（含仅提交未装载对象、未知对象、
+  目标对象自身）。候选字节本身结构非法、引入缺失依赖或矛盾版本引用时，按
+  既有规则报告该候选对象上的**首个**结构错误。
+- 成功创建返回 `201`；完全相同的基础审计、对象名、候选字节重放返回 `200`
+  与同一冻结复核；三者任一不同而复用同一 `review_id` 返回 `409`（复核标识
+  全局冻结基础审计，跨基础审计复用同样冲突），原复核与基础审计裁决均不变。
+- 基础审计未知返回 `404`；JSON/Base64/标识格式等请求级错误返回 `400`。
+
+### `GET /audits/{id}/replacement-reviews/{rid}`
+
+返回冻结的替换复核（`200`）；基础审计未知返回 `404`，基础审计存在但复核
+标识未知同样返回 `404`；复核不会经由其他基础审计路径读出。
+
+### 替换复核结构
+
+```json
+{
+  "review_id": "rv-1",
+  "base_audit_id": "shadow-1",
+  "review_sha256": "…",
+  "candidate_sha256": "…",
+  "status": "passed | failed | rejected",
+  "target": "fc_core.so",
+  "replaced_object": "liba.so",
+  "load_order": ["fc_core.so", "liba.so", "libb.so"],
+  "diffs": [
+    {"object": "fc_core.so", "symbol_index": 1, "symbol": "nav_update",
+     "bind": "GLOBAL",
+     "requirement": {"version": "FC_2.0", "file": "liba.so"},
+     "change": "rebound",
+     "before": {"status": "bound",
+                "resolution": {"object": "liba.so", "symbol_index": 1,
+                               "version_basis": {"kind": "verdef",
+                                                 "version": "FC_2.0",
+                                                 "index": 2}}},
+     "after":  {"status": "bound",
+                "resolution": {"object": "libb.so", "symbol_index": 1,
+                               "version_basis": {"kind": "verdef",
+                                                 "version": "FC_2.0",
+                                                 "index": 2}}}}
+  ],
+  "diff_summary": {"unchanged": 0, "rebound": 1, "unbound": 0,
+                   "newly_bound": 0, "structural_rejected": 0},
+  "first_unresolved": null,
+  "error": null
+}
+```
+
+- `diffs` 逐项覆盖**目标对象**的每个未定义 GLOBAL/WEAK 引用，顺序与冻结
+  裁决一致；`change` 为 `unchanged` / `rebound`（原绑定→新绑定）/ `unbound`
+  （原绑定→未绑定）/ `newly_bound`（原未绑定，多见于弱引用→新绑定）/
+  `structural_rejected`（重放被结构拒绝，`after` 为 `null`）。
+- 绑定身份按定义对象 + 版本依据（kind/version）稳定比较，候选对象内部
+  dynsym/verdef 索引重排不会误报改绑；完整 `resolution`（含索引）保留在
+  `before`/`after` 快照中。`unbound` 的 `after.reason` 与顶层
+  `first_unresolved` 给出首个未解析依据。
+- 复核存放在独立存储中，永不修改基础审计裁决或其他复核；既有审计的
+  重放（`200`）、读取（`GET`）及其余依赖绑定结论保持不变。
 
 ### 裁决结构
 
@@ -99,5 +178,6 @@ make verify-local  # 对本地服务跑端到端验收
 
 `verify` 依次执行：API/HTTP 冒烟 → 版本遮蔽场景（含反转装载序对照）→
 穿插解析规则单元测试 → 弱符号场景 → 损坏动态表场景（不可映射表、截断、
-矛盾版本引用、缺失依赖、重复对象名）→ 冻结裁决重放/冲突矩阵，全部通过
-时以退出码 0 结束，否则为 1。
+矛盾版本引用、缺失依赖、重复对象名）→ 冻结裁决重放/冲突矩阵 →
+替换复核场景（逐项差异、缺失依赖/不兼容版本/结构拒绝、前提失败、
+重放/冲突矩阵、与冻结审计的隔离），全部通过时以退出码 0 结束，否则为 1。

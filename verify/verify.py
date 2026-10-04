@@ -8,7 +8,9 @@ Runs against a healthy ``app`` container (or a locally started server):
 3.  parsing-rule unit tests (interleaved),
 4.  weak-symbol scenario (weak references may stay unbound),
 5.  corrupted dynamic-table scenarios (rejection with first error),
-6.  frozen-verdict replay / conflict semantics.
+6.  frozen-verdict replay / conflict semantics,
+7.  replacement-review scenarios (reference diffs, rejection preconditions,
+    replay/conflict matrix, isolation from the frozen audits).
 
 Exits 0 when every check passes, 1 otherwise.
 """
@@ -74,6 +76,17 @@ def post_audit(audit_id: str, target_name: str, target: bytes,
         "dependencies": [{"name": n, "data": b64(d)} for n, d in deps],
     }
     return http("POST", "/audits", payload)
+
+
+def post_review(audit_id: str, review_id: str, object_name: str,
+                candidate: bytes):
+    payload = {"review_id": review_id, "object_name": object_name,
+               "candidate": b64(candidate)}
+    return http("POST", f"/audits/{audit_id}/replacement-reviews", payload)
+
+
+def get_review(audit_id: str, review_id: str):
+    return http("GET", f"/audits/{audit_id}/replacement-reviews/{review_id}")
 
 
 def wait_for_app(timeout: float = 60.0) -> None:
@@ -363,6 +376,265 @@ def step_replay_and_conflict(frozen: dict) -> None:
           f"got {status}")
 
 
+def step_replacement_reviews(frozen: dict) -> None:
+    print("== replacement review scenarios ==", flush=True)
+    # Dedicated base audit: libb impersonates file liba.so (same SONAME)
+    # and defines nav_update@FC_2.0, but only liba provides log_emit.
+    # Swapping liba can therefore produce both a rebound (nav_update
+    # falls through to libb) and an unbound strong reference (log_emit).
+    rv_liba = (ElfBuilder(soname="liba.so")
+               .verdef("FC_2.0")
+               .symbol("nav_update", version="FC_2.0", value=0xA000)
+               .symbol("log_emit", value=0xA100)
+               .build())
+    rv_libb = (ElfBuilder(soname="liba.so")
+               .verdef("FC_2.0")
+               .symbol("nav_update", version="FC_2.0", value=0xB000)
+               .build())
+    rv_target = (ElfBuilder(soname="fc_core.so")
+                 .need("liba.so")
+                 .need("libb.so")
+                 .symbol("nav_update", defined=False, version="FC_2.0",
+                         version_file="liba.so")
+                 .symbol("log_emit", defined=False)
+                 .build())
+    rv_deps = [("liba.so", rv_liba), ("libb.so", rv_libb)]
+    status, body = post_audit("rv-base", "fc_core.so", rv_target, rv_deps)
+    check("rv-base audit created", status == 201, f"got {status}: {body!r}")
+    base_rv = json.loads(body) if status in (200, 201) else {}
+    check("rv-base binds both references to liba",
+          {r["symbol"]: r["resolution"]["object"]
+           for r in base_rv.get("references", [])}
+          == {"nav_update": "liba.so", "log_emit": "liba.so"},
+          json.dumps(base_rv.get("references"))[:300])
+
+    # 1. Byte-identical candidate: every target reference is unchanged.
+    status, body = post_review("rv-base", "rv-same", "liba.so", rv_liba)
+    check("identical-candidate review created (201)",
+          status == 201, f"got {status}: {body!r}")
+    rv_same = json.loads(body) if status in (200, 201) else {}
+    check("identical candidate leaves every reference unchanged",
+          rv_same.get("status") == "passed"
+          and all(d["change"] == "unchanged"
+                  for d in rv_same.get("diffs", []))
+          and rv_same.get("diff_summary", {}).get("unchanged") == 2,
+          json.dumps(rv_same)[:500])
+
+    # Replay with the exact same base audit / object / bytes -> 200,
+    # and GET returns the identical frozen review.
+    status, body = post_review("rv-base", "rv-same", "liba.so", rv_liba)
+    check("identical review replay returns 200",
+          status == 200 and json.loads(body) == rv_same,
+          f"got {status}: {body!r}")
+    status, body = get_review("rv-base", "rv-same")
+    check("GET review returns the frozen record",
+          status == 200 and json.loads(body) == rv_same,
+          f"got {status}: {body!r}")
+
+    # 2. Stripped candidate: libb impersonates file liba.so via SONAME
+    #    and still provides nav_update@FC_2.0 -> rebound; the
+    #    unversioned log_emit disappears from the whole scope -> unbound.
+    stripped = (ElfBuilder(soname="liba.so").build())
+    status, body = post_review("rv-base", "rv-strip", "liba.so", stripped)
+    rv_strip = json.loads(body) if status in (200, 201) else {}
+    d = {x["symbol"]: x for x in rv_strip.get("diffs", [])}
+    check("stripped candidate fails the replay",
+          rv_strip.get("status") == "failed"
+          and rv_strip.get("error") is None,
+          json.dumps(rv_strip)[:400])
+    check("versioned reference rebounds to later SONAME match",
+          d.get("nav_update", {}).get("change") == "rebound"
+          and d["nav_update"]["before"]["resolution"]["object"] == "liba.so"
+          and d["nav_update"]["after"]["resolution"]["object"] == "libb.so",
+          json.dumps(d.get("nav_update"))[:300])
+    check("lost unversioned reference is unbound with first basis",
+          d.get("log_emit", {}).get("change") == "unbound"
+          and d["log_emit"]["after"]["status"] == "unbound"
+          and "no visible definition" in d["log_emit"]["after"].get("reason", "")
+          and rv_strip.get("first_unresolved", {}).get("symbol") == "log_emit",
+          json.dumps(d.get("log_emit"))[:300])
+
+    # 3. Incompatible version: a lone candidate downgrading FC_2.0 to
+    #    FC_1.0 cannot satisfy the versioned strong reference.
+    ver_target = (ElfBuilder(soname="fc_core.so")
+                  .need("liba.so")
+                  .symbol("nav_update", defined=False, version="FC_2.0",
+                          version_file="liba.so")
+                  .build())
+    ver_liba = (ElfBuilder(soname="liba.so")
+                .verdef("FC_2.0")
+                .symbol("nav_update", version="FC_2.0", value=0xA000)
+                .build())
+    status, body = post_audit("rv-ver", "fc_core.so", ver_target,
+                              [("liba.so", ver_liba)])
+    check("rv-ver base audit created", status == 201, f"got {status}")
+    downgraded = (ElfBuilder(soname="liba.so")
+                  .verdef("FC_1.0")
+                  .symbol("nav_update", version="FC_1.0", value=0xC000)
+                  .build())
+    status, body = post_review("rv-ver", "rv-badver", "liba.so", downgraded)
+    rv_badver = json.loads(body) if status in (200, 201) else {}
+    dv = {x["symbol"]: x for x in rv_badver.get("diffs", [])}
+    check("incompatible version fails with locatable reason",
+          rv_badver.get("status") == "failed"
+          and rv_badver.get("error") is None
+          and dv.get("nav_update", {}).get("change") == "unbound"
+          and "FC_2.0" in dv["nav_update"]["after"].get("reason", ""),
+          json.dumps(rv_badver)[:500])
+
+    # 4. Candidate introduces a missing dependency -> structural reject.
+    needy = (ElfBuilder(soname="liba.so")
+             .need("libghost.so")
+             .build())
+    status, body = post_review("rv-base", "rv-ghost", "liba.so", needy)
+    rv_ghost = json.loads(body) if status in (200, 201) else {}
+    check("candidate with missing dependency rejected",
+          rv_ghost.get("status") == "rejected"
+          and rv_ghost["error"]["field"] == "DT_NEEDED"
+          and rv_ghost["error"]["object"] == "liba.so"
+          and "libghost.so" in rv_ghost["error"]["message"]
+          and all(x["change"] == "structural_rejected"
+                  for x in rv_ghost.get("diffs", [])),
+          json.dumps(rv_ghost)[:400])
+
+    # 5. Structurally malformed candidate -> first error located on it.
+    status, body = post_review("rv-base", "rv-malformed", "liba.so",
+                               b"\x7fELFgarbage")
+    rv_bad = json.loads(body) if status in (200, 201) else {}
+    check("malformed candidate rejected under its object name",
+          rv_bad.get("status") == "rejected"
+          and rv_bad.get("error", {}).get("object") == "liba.so"
+          and rv_bad.get("error", {}).get("field"),
+          json.dumps(rv_bad)[:400])
+
+    # 6. Pre-condition failures: unknown name, target name, and an
+    #    object submitted but never actually loaded.
+    status, body = post_review("rv-base", "rv-outscope", "libghost.so",
+                               rv_liba)
+    rv_out = json.loads(body) if status in (200, 201) else {}
+    check("object name outside actual load scope rejected",
+          rv_out.get("status") == "rejected"
+          and rv_out["error"]["field"] == "object_name"
+          and "libghost.so" in rv_out["error"]["message"],
+          json.dumps(rv_out)[:400])
+
+    status, body = post_review("rv-base", "rv-target", "fc_core.so",
+                               rv_target)
+    rv_tgt = json.loads(body) if status in (200, 201) else {}
+    check("replacing the target itself is rejected",
+          rv_tgt.get("status") == "rejected"
+          and rv_tgt["error"]["field"] == "object_name",
+          json.dumps(rv_tgt)[:300])
+
+    target, deps = shadowing_fixtures()
+    libextra = ElfBuilder(soname="libextra.so").build()
+    status, body = post_audit("base-extra", "fc_core.so", target,
+                              [deps[0], deps[1], ("libextra.so", libextra)])
+    check("base-extra audit created", status == 201, f"got {status}")
+    status, body = post_review("base-extra", "rv-unused", "libextra.so",
+                               libextra)
+    rv_unused = json.loads(body) if status in (200, 201) else {}
+    check("unloaded dependency cannot be reviewed",
+          rv_unused.get("status") == "rejected"
+          and rv_unused["error"]["field"] == "object_name"
+          and "actual load scope" in rv_unused["error"]["message"],
+          json.dumps(rv_unused)[:300])
+
+    # 7. A review cannot be based on a structurally rejected audit.
+    status, body = post_review("corrupt-1", "rv-base-reject",
+                               "fc_core.so", target)
+    rv_base = json.loads(body) if status in (200, 201) else {}
+    check("review over rejected base audit is refused",
+          rv_base.get("status") == "rejected"
+          and rv_base["error"]["field"] == "base_audit"
+          and rv_base.get("diffs") == [],
+          json.dumps(rv_base)[:300])
+
+    # 8. Conflict matrix: the same review id only replays the exact
+    #    (base audit, object name, candidate bytes) triple.
+    tampered = stripped[:-1] + bytes([stripped[-1] ^ 0x01])
+    status, _ = post_review("rv-base", "rv-same", "liba.so", tampered)
+    check("changed candidate bytes conflict (409)", status == 409,
+          f"got {status}")
+    status, _ = post_review("rv-base", "rv-same", "libb.so", rv_liba)
+    check("changed object name conflicts (409)", status == 409,
+          f"got {status}")
+    status, body = get_review("rv-base", "rv-same")
+    check("original review still frozen after conflicts",
+          status == 200 and json.loads(body) == rv_same,
+          f"got {status}: {body!r}")
+
+    # Reusing a review id under a different base audit also conflicts.
+    status, _ = post_review("shadow-1", "rv-same", "liba.so", deps[0][1])
+    check("review id reused under another base audit conflicts (409)",
+          status == 409, f"got {status}")
+    status, _ = get_review("shadow-1", "rv-same")
+    check("review is not readable through another audit path",
+          status == 404, f"got {status}")
+
+    # 9. Isolation: the base audits and other reviews are untouched, and
+    #    replaying an audit still yields its original verdict.
+    status, body = http("GET", "/audits/rv-base")
+    check("base audit verdict is not polluted by reviews",
+          status == 200 and json.loads(body) == base_rv,
+          f"got {status}: {body!r}")
+    status, body = http("GET", "/audits/shadow-1")
+    check("shadow-1 verdict remains byte-identical",
+          status == 200 and json.loads(body) == frozen,
+          f"got {status}: {body!r}")
+    status, body = post_audit("shadow-1", "fc_core.so", target, deps)
+    check("base audit replay semantics unchanged",
+          status == 200 and json.loads(body) == frozen,
+          f"got {status}")
+    status, body = get_review("rv-base", "rv-strip")
+    check("other review remains independently readable",
+          status == 200 and json.loads(body) == rv_strip,
+          f"got {status}")
+
+    # 10. HTTP surface: unknown ids, wrong method, malformed requests.
+    status, _ = post_review("never-seen", "rv-x", "liba.so", rv_liba)
+    check("review on unknown base audit -> 404", status == 404,
+          f"got {status}")
+    status, _ = get_review("rv-base", "never-seen-review")
+    check("GET unknown review -> 404", status == 404, f"got {status}")
+    status, _ = http("GET", "/audits/rv-base/replacement-reviews")
+    check("GET review collection -> 405", status == 405, f"got {status}")
+    status, _ = http("POST", "/audits/rv-base/replacement-reviews",
+                     raw=b"{bad json")
+    check("malformed review JSON -> 400", status == 400, f"got {status}")
+    status, _ = http("POST", "/audits/rv-base/replacement-reviews",
+                     {"review_id": "rv-nocand", "object_name": "liba.so"})
+    check("review missing candidate -> 400", status == 400, f"got {status}")
+    status, _ = http("POST", "/audits/rv-base/replacement-reviews",
+                     {"review_id": "rv!", "object_name": "liba.so",
+                      "candidate": b64(rv_liba)})
+    check("malformed review id -> 400", status == 400, f"got {status}")
+
+    # 11. Weak reference newly bound after the swap (non-fatal before
+    #     and after).
+    weak_lib = (ElfBuilder(soname="liba.so").build())
+    weak_target = (ElfBuilder(soname="fc_core.so")
+                   .need("liba.so")
+                   .symbol("optional_trace", defined=False, bind="WEAK")
+                   .build())
+    status, body = post_audit("weak-rev", "fc_core.so", weak_target,
+                              [("liba.so", weak_lib)])
+    check("weak-review base audit created", status == 201, f"got {status}")
+    weak_candidate = (ElfBuilder(soname="liba.so")
+                      .symbol("optional_trace", bind="WEAK", value=0x7000)
+                      .build())
+    status, body = post_review("weak-rev", "rv-weak", "liba.so",
+                               weak_candidate)
+    rv_weak = json.loads(body) if status in (200, 201) else {}
+    dw = {x["symbol"]: x for x in rv_weak.get("diffs", [])}
+    check("weak reference newly bound by replacement",
+          rv_weak.get("status") == "passed"
+          and dw.get("optional_trace", {}).get("change") == "newly_bound"
+          and dw["optional_trace"]["before"]["status"] == "unbound"
+          and dw["optional_trace"]["after"]["status"] == "bound",
+          json.dumps(rv_weak)[:400])
+
+
 def main() -> None:
     wait_for_app()
     step_smoke()
@@ -371,6 +643,7 @@ def main() -> None:
     step_weak_symbols()
     step_corrupted_tables()
     step_replay_and_conflict(frozen)
+    step_replacement_reviews(frozen)
     summary_and_exit()
 
 
